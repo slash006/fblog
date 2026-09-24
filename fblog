@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+
+check_dependencies() {
+    if ! command -v jq &> /dev/null; then
+        echo "Error: 'jq' is not installed. Please install it: sudo pacman -S jq" >&2
+        exit 1
+    fi
+}
+
+to_kebab() {
+    echo "$1" | sed -E 's/([a-z0-9])([A-Z])/\1-\2/g' | tr '[:upper:]' '[:lower:]' | tr '_' '-'
+}
+
+to_camel() {
+    echo "$1" | sed -E 's/-([a-z])/\U\1/g'
+}
+
+to_snake() {
+    echo "$1" | tr '-' '_'
+}
+
+show_help() {
+    echo "Usage: fblog <file.json> [options/filters]"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help               Show this help message"
+    echo "  -v, --verbose            Show debug information and generated jq query"
+    echo "  -u, --until <string>     Stream logs after match until this string/delimiter occurs"
+    echo "  -n, -A, --next <number>  Print match and the next N log entries"
+    echo ""
+    echo "Examples:"
+    echo "  fblog logs.json --text-payload \"FIRESTORE PROFILER\" --until \"-----\""
+    echo "  fblog logs.json --text-payload \"EventSummaryService\" -n 4"
+    echo "  fblog logs.json --status 404 --until \"-----\""
+    echo ""
+    
+    if [[ -f "$JSON_FILE" ]]; then
+        echo "Available filters detected in '$JSON_FILE':"
+        local keys
+        keys=$(jq -r 'if type == "array" then .[] else . end | paths(scalars)[-1]' "$JSON_FILE" 2>/dev/null | sort -u)
+        for key in $keys; do
+            local kebab
+            kebab=$(to_kebab "$key")
+            printf "  --%-30s (matches: %s)\n" "$kebab <value>" "$key"
+        done
+    else
+        echo "Hint: Provide a JSON file with the -h flag to list all available filters for it:"
+        echo "  fblog logs.json -h"
+    fi
+}
+
+parse_arguments() {
+    JSON_FILE=""
+    SHOW_HELP=false
+    VERBOSE=false
+    UNTIL_DELIM=""
+    NEXT_COUNT=0
+    FILTER_ARGS=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                SHOW_HELP=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -u|--until)
+                shift
+                UNTIL_DELIM="$1"
+                shift
+                ;;
+            -n|-A|--next)
+                shift
+                NEXT_COUNT="$1"
+                shift
+                ;;
+            *)
+                if [[ -z "$JSON_FILE" && -f "$1" ]]; then
+                    JSON_FILE="$1"
+                else
+                    FILTER_ARGS+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+}
+
+build_jq_filter() {
+    JQ_ARGS=()
+    local jq_selects=()
+    local filter_idx=0
+    local i=0
+    local total=${#FILTER_ARGS[@]}
+
+    while [[ $i -lt $total ]]; do
+        local arg="${FILTER_ARGS[$i]}"
+        if [[ "$arg" =~ ^-- ]]; then
+            local param="${arg#--}"
+            i=$((i + 1))
+            local val="${FILTER_ARGS[$i]}"
+            
+            local camel snake var_name
+            camel=$(to_camel "$param")
+            snake=$(to_snake "$param")
+            var_name="v_$filter_idx"
+            
+            JQ_ARGS+=(--arg "$var_name" "$val")
+            jq_selects+=("([.. | (select(type == \"object\") | .[\"$camel\"]? // .[\"$snake\"]? // .[\"$param\"]? // empty) | tostring | ascii_downcase | contains(\$$var_name | ascii_downcase)] | any)")
+            
+            filter_idx=$((filter_idx + 1))
+        fi
+        i=$((i + 1))
+    done
+
+    if [[ ${#jq_selects[@]} -gt 0 ]]; then
+        local joined
+        joined=$(printf " and %s" "${jq_selects[@]}")
+        RAW_MATCH_EXPR="${joined:5}"
+    else
+        RAW_MATCH_EXPR="true"
+    fi
+
+    if [[ -n "$UNTIL_DELIM" || "$NEXT_COUNT" -gt 0 ]]; then
+        JQ_ARGS+=(--arg "until_delim" "$UNTIL_DELIM")
+        JQ_ARGS+=(--argjson "next_count" "$NEXT_COUNT")
+
+        STREAM_FILTER="
+          foreach (if type == \"array\" then .[] else . end) as \$item (
+            { active: false, remaining: 0, emit: false, item: null };
+            
+            (\$item | $RAW_MATCH_EXPR) as \$matched |
+            (\$until_delim != \"\" and ([\$item | .. | (select(type == \"object\") | .textPayload? // .[\"text-payload\"]? // empty) | tostring | ascii_downcase | contains(\$until_delim | ascii_downcase)] | any)) as \$is_delim |
+            
+            if \$matched then
+              {
+                active: (if \$is_delim or (\$next_count == 1) then false else true end),
+                remaining: (if \$next_count > 1 then (\$next_count - 1) else 0 end),
+                emit: true,
+                item: \$item
+              }
+            elif .active then
+              if \$is_delim then
+                { active: false, remaining: 0, emit: true, item: \$item }
+              elif \$next_count > 0 then
+                if .remaining > 0 then
+                  { active: (if .remaining == 1 then false else true end), remaining: (.remaining - 1), emit: true, item: \$item }
+                else
+                  { active: false, remaining: 0, emit: false, item: null }
+                end
+              else
+                { active: true, remaining: 0, emit: true, item: \$item }
+              end
+            else
+              { active: false, remaining: 0, emit: false, item: null }
+            end;
+            select(.emit) | .item
+          ) |
+        "
+    else
+        if [[ "$RAW_MATCH_EXPR" != "true" ]]; then
+            STREAM_FILTER="(if type == \"array\" then .[] else . end) | select($RAW_MATCH_EXPR) |"
+        else
+            STREAM_FILTER="(if type == \"array\" then .[] else . end) |"
+        fi
+    fi
+}
+
+execute_viewer() {
+    local jq_program="
+      def c_gray: \"\u001b[90m\";
+      def c_cyan: \"\u001b[36m\";
+      def c_green: \"\u001b[32m\";
+      def c_yellow: \"\u001b[33m\";
+      def c_red: \"\u001b[31m\";
+      def c_bold: \"\u001b[1m\";
+      def reset: \"\u001b[0m\";
+
+      def status_color: 
+        if . >= 500 then c_red 
+        elif . >= 400 then c_yellow 
+        elif . >= 300 then c_cyan 
+        else c_green end;
+
+      def format_time:
+        if .timestamp then
+          (
+            (.timestamp | sub(\"\\\\.[0-9]+Z$\"; \"Z\") | fromdateiso8601 | localtime | strftime(\"%H:%M:%S\"))
+            + \".\" + 
+            ((.timestamp | capture(\"\\\\.(?<ms>[0-9]{3})\") | .ms) // \"000\")
+          )
+        else
+          \"??:??:??.000\"
+        end;
+
+      $STREAM_FILTER
+      (
+        (c_gray + format_time + reset) + \" \" +
+        if .httpRequest then
+          \"🌐 \" + c_bold + .httpRequest.requestMethod + reset + \" \" +
+          (.httpRequest.status | status_color + tostring + reset) + \" \" +
+          .httpRequest.requestUrl + 
+          c_gray + \" (\" + (.httpRequest.latency // \"0s\") + \")\" + reset
+        elif .textPayload then
+          (if .severity == \"ERROR\" then c_red + \"❌ \" elif .severity == \"WARNING\" then c_yellow + \"⚠️ \" else \"\" end) +
+          (.textPayload | rtrimstr(\"\\n\")) + reset
+        else
+          c_cyan + (.jsonPayload | tostring) + reset
+        end
+      )
+    "
+
+    if [[ "$VERBOSE" = true ]]; then
+        echo "=== DEBUG INFO ===" >&2
+        echo "Target file: $JSON_FILE" >&2
+        echo "Stream filter: $STREAM_FILTER" >&2
+        echo "JQ arguments: ${JQ_ARGS[*]}" >&2
+        echo "==================" >&2
+    fi
+
+    jq -r "${JQ_ARGS[@]}" "$jq_program" "$JSON_FILE"
+}
+
+main() {
+    check_dependencies
+    parse_arguments "$@"
+
+    if [[ "$SHOW_HELP" = true || -z "$JSON_FILE" ]]; then
+        show_help
+        exit 0
+    fi
+
+    build_jq_filter
+    execute_viewer
+}
+
+main "$@"
